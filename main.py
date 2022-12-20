@@ -23,6 +23,8 @@ import matplotlib.pyplot as plt
 def get_argparser():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--ngpu', type=int, default=4)
     # Datset Options
     parser.add_argument("--data_root", type=str, default='./datasets/data',
                         help="path to Dataset")
@@ -46,7 +48,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--total_itrs", type=int, default=30e3,
+    parser.add_argument("--total_itrs", type=int, default=40e3,
                         help="epoch number (default: 30k)")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="learning rate (default: 0.01)")
@@ -158,8 +160,8 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
     metrics.reset()
     ret_samples = []
     if opts.save_val_results:
-        if not os.path.exists('results'):
-            os.mkdir('results')
+        #if not os.path.exists('results'):
+        #    os.mkdir('results')
         denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406],
                                    std=[0.229, 0.224, 0.225])
         img_id = 0
@@ -221,10 +223,25 @@ def main():
     if vis is not None:  # display options
         vis.vis_table("Options", vars(opts))
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("Device: %s" % device)
 
+        
+    # os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # print("Device: %s" % device)
+
+    
+    torch.cuda.set_device(opts.local_rank)
+
+    world_size = opts.ngpu
+    torch.distributed.init_process_group(
+        'nccl',
+        init_method='env://',
+        world_size=world_size,
+        rank=opts.local_rank,
+    )
+    
+    device = torch.device('cuda:{}'.format(opts.local_rank))
+    
     # Setup random seed
     torch.manual_seed(opts.random_seed)
     np.random.seed(opts.random_seed)
@@ -235,16 +252,35 @@ def main():
         opts.val_batch_size = 1
 
     train_dst, val_dst = get_dataset(opts)
-    train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
-        drop_last=True)  # drop_last=True to ignore single-image batches.
+ 
+    sampler_1 = torch.utils.data.distributed.DistributedSampler(
+                                                                train_dst,
+                                                                num_replicas=opts.ngpu,
+                                                                rank=opts.local_rank,
+                                                            )
+    sampler_2 = torch.utils.data.distributed.DistributedSampler(
+                                                                val_dst,
+                                                                num_replicas=opts.ngpu,
+                                                                rank=opts.local_rank,
+                                                            )
+    
+    train_loader = data.DataLoader(train_dst, batch_size=opts.batch_size, num_workers=4, drop_last=True,sampler = sampler_1)  # drop_last=True to ignore single-image batches.
     val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+        val_dst, batch_size=opts.val_batch_size, num_workers=4,sampler = sampler_2)    
+    # train_loader = data.DataLoader(
+    #     train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=8,
+    #     drop_last=True)  # drop_last=True to ignore single-image batches.
+    # val_loader = data.DataLoader(
+    #     val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=8)
     print("Dataset: %s, Train set: %d, Val set: %d" %
           (opts.dataset, len(train_dst), len(val_dst)))
 
     # Set up model (all models are 'constructed at network.modeling)
     model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+    
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model.to(device)
+    
     if opts.separable_conv and 'plus' in opts.model:
         network.convert_to_separable_conv(model.classifier)
     utils.set_bn_momentum(model.backbone, momentum=0.01)
@@ -274,14 +310,15 @@ def main():
     def save_ckpt(path):
         """ save current model
         """
-        torch.save({
-            "cur_itrs": cur_itrs,
-            "model_state": model.module.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
-            "best_score": best_score,
-        }, path)
-        print("Model saved as %s" % path)
+        if opts.local_rank == 0:
+            torch.save({
+                "cur_itrs": cur_itrs,
+                "model_state": model.module.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "best_score": best_score,
+            }, path)
+            print("Model saved as %s" % path)
 
     utils.mkdir('checkpoints')
     # Restore
@@ -292,8 +329,14 @@ def main():
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
         checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
         model.load_state_dict(checkpoint["model_state"])
-        model = nn.DataParallel(model)
-        model.to(device)
+        #model = nn.DataParallel(model)
+        
+        model = torch.nn.parallel.DistributedDataParallel(
+                                                model,
+                                                device_ids=[opts.local_rank],
+                                                output_device=opts.local_rank,
+                                                )
+        #model.to(save_ckpt)
         if opts.continue_training:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -304,9 +347,15 @@ def main():
         del checkpoint  # free memory
     else:
         print("[!] Retrain")
-        model = nn.DataParallel(model)
-        model.to(device)
+        model = torch.nn.parallel.DistributedDataParallel(
+                                                        model,
+                                                        device_ids=[opts.local_rank],
+                                                        output_device=opts.local_rank,
+                                                        )
+        # model = nn.DataParallel(model)
+        # model.to(device)
 
+        
     # ==========   Train Loop   ==========#
     vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
                                       np.int32) if opts.enable_vis else None  # sample idxs for visualization
@@ -341,13 +390,13 @@ def main():
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)
 
-            if (cur_itrs) % 10 == 0:
+            if ( ( (cur_itrs) % 10 == 0 ) and opts.local_rank == 0):
                 interval_loss = interval_loss / 10
                 print("Epoch %d, Itrs %d/%d, Loss=%f" %
                       (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
                 interval_loss = 0.0
 
-            if (cur_itrs) % opts.val_interval == 0:
+            if ( ( (cur_itrs) % opts.val_interval == 0 ) and opts.local_rank == 0):
                 save_ckpt('checkpoints/latest_%s_%s_os%d.pth' %
                           (opts.model, opts.dataset, opts.output_stride))
                 print("validation...")
